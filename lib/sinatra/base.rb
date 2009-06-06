@@ -356,6 +356,7 @@ module Sinatra
 
     def initialize(app=nil)
       @app = app
+      @running = false
       yield self if block_given?
     end
 
@@ -855,6 +856,15 @@ module Sinatra
         @middleware << [middleware, args, block]
       end
 
+      # Allow someone to externally query Sinatra to see if it
+      # is up and running yet (trap(:INT) has been set, etc).
+      #
+      # This is useful for Sinatra apps embedded inside of another
+      # program.
+      def running?
+        @running
+      end
+
       # Run the Sinatra app as a self-hosted server using
       # Thin, Mongrel or WEBrick (in that order)
       def run!(options={})
@@ -869,7 +879,10 @@ module Sinatra
             server.respond_to?(:stop!) ? server.stop! : server.stop
             puts "\n== Sinatra has ended his set (crowd applauds)" unless handler_name =~/cgi/i
           end
+          
+          @running = true
         end
+        
       rescue Errno::EADDRINUSE => e
         puts "== Someone is already performing on port #{port}!"
       end
