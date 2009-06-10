@@ -6,7 +6,7 @@ require 'rack/builder'
 require 'sinatra/showexceptions'
 
 module Sinatra
-  VERSION = '0.9.2'
+  VERSION = '0.10.1'
 
   # The request object. See Rack::Request for more info:
   # http://rack.rubyforge.org/doc/classes/Rack/Request.html
@@ -23,7 +23,7 @@ module Sinatra
     # Override Rack 0.9.x's #params implementation (see #72 in lighthouse)
     def params
       self.GET.update(self.POST)
-    rescue EOFError => boom
+    rescue EOFError, Errno::ESPIPE
       self.GET
     end
   end
@@ -208,7 +208,7 @@ module Sinatra
 
   end
 
-  # Template rendering methods. Each method takes a the name of a template
+  # Template rendering methods. Each method takes the name of a template
   # to render as a Symbol and returns a String with the rendered output,
   # as well as an optional hash with additional options.
   #
@@ -223,27 +223,19 @@ module Sinatra
   #                 in the template
   module Templates
     def erb(template, options={}, locals={})
-      require_warn('ERB') unless defined?(::ERB)
-
       render :erb, template, options, locals
     end
 
     def haml(template, options={}, locals={})
-      require_warn('Haml') unless defined?(::Haml::Engine)
-
       render :haml, template, options, locals
     end
 
     def sass(template, options={}, locals={})
-      require_warn('Sass') unless defined?(::Sass::Engine)
-
       options[:layout] = false
       render :sass, template, options, locals
     end
 
     def builder(template=nil, options={}, locals={}, &block)
-      require_warn('Builder') unless defined?(::Builder)
-
       options, template = template, nil if template.is_a?(Hash)
       template = lambda { block } if template.nil?
       render :builder, template, options, locals
@@ -278,21 +270,31 @@ module Sinatra
     def lookup_template(engine, template, views_dir, filename = nil, line = nil)
       case template
       when Symbol
-        if cached = self.class.templates[template]
-          lookup_template(engine, cached[:template], views_dir, cached[:filename], cached[:line])
-        else
-          path = ::File.join(views_dir, "#{template}.#{engine}")
-          [ ::File.read(path), path, 1 ]
-        end
+        load_template(engine, template, views_dir, options)
       when Proc
         filename, line = self.class.caller_locations.first if filename.nil?
-        [ template.call, filename, line.to_i ]
+        [template.call, filename, line.to_i]
       when String
         filename, line = self.class.caller_locations.first if filename.nil?
-        [ template, filename, line.to_i ]
+        [template, filename, line.to_i]
       else
         raise ArgumentError
       end
+    end
+
+    def load_template(engine, template, views_dir, options={})
+      base = self.class
+      while base.respond_to?(:templates)
+        if cached = base.templates[template]
+          return lookup_template(engine, cached[:template], views_dir, cached[:filename], cached[:line])
+        else
+          base = base.superclass
+        end
+      end
+
+      # If no template exists in the cache, try loading from disk.
+      path = ::File.join(views_dir, "#{template}.#{engine}")
+      [ ::File.read(path), path, 1 ]
     end
 
     def lookup_layout(engine, template, views_dir)
@@ -339,11 +341,6 @@ module Sinatra
       end
       xml.target!
     end
-
-    def require_warn(engine)
-      warn "Auto-require of #{engine} is deprecated; add require '#{engine}' to your app."
-      require engine.downcase
-    end
   end
 
   # Base class for all Sinatra applications and middleware.
@@ -371,7 +368,7 @@ module Sinatra
       @env      = env
       @request  = Request.new(env)
       @response = Response.new
-      @params   = nil
+      @params   = indifferent_params(@request.params)
 
       invoke { dispatch! }
       invoke { error_block!(response.status) }
@@ -419,21 +416,15 @@ module Sinatra
     end
 
   private
-    # Run before filters and then locate and run a matching route.
-    def route!
-      # enable nested params in Rack < 1.0; allow indifferent access
-      @params =
-        if Rack::Utils.respond_to?(:parse_nested_query)
-          indifferent_params(@request.params)
-        else
-          nested_params(@request.params)
-        end
+    # Run before filters defined on the class and all superclasses.
+    def filter!(base=self.class)
+      filter!(base.superclass) if base.superclass.respond_to?(:filters)
+      base.filters.each { |block| instance_eval(&block) }
+    end
 
-      # before filters
-      self.class.filters.each { |block| instance_eval(&block) }
-
-      # routes
-      if routes = self.class.routes[@request.request_method]
+    # Run routes defined on the class and all superclasses.
+    def route!(base=self.class)
+      if routes = base.routes[@request.request_method]
         original_params = @params
         path            = unescape(@request.path_info)
 
@@ -465,6 +456,14 @@ module Sinatra
             end
           end
         end
+
+        @params = original_params
+      end
+
+      # Run routes defined in superclass.
+      if base.superclass.respond_to?(:routes)
+        route! base.superclass
+        return
       end
 
       route_missing
@@ -488,29 +487,25 @@ module Sinatra
       end
     end
 
+    # Attempt to serve static files from public directory. Throws :halt when
+    # a matching file is found, returns nil otherwise.
+    def static!
+      return if (public_dir = options.public).nil?
+      public_dir = File.expand_path(public_dir)
+
+      path = File.expand_path(public_dir + unescape(request.path_info))
+      return if path[0, public_dir.length] != public_dir
+      return unless File.file?(path)
+
+      send_file path, :disposition => nil
+    end
+
     # Enable string or symbol key access to the nested params hash.
     def indifferent_params(params)
       params = indifferent_hash.merge(params)
       params.each do |key, value|
         next unless value.is_a?(Hash)
         params[key] = indifferent_params(value)
-      end
-    end
-
-    # Recursively replace the params hash with a nested indifferent
-    # hash. Rack 1.0 has a built in implementation of this method - remove
-    # this once Rack 1.0 is required.
-    def nested_params(params)
-      return indifferent_hash.merge(params) if !params.keys.join.include?('[')
-      params.inject indifferent_hash do |res, (key,val)|
-        if key.include?('[')
-          head = key.split(/[\]\[]+/)
-          last = head.pop
-          head.inject(res){ |hash,k| hash[k] ||= indifferent_hash }[last] = val
-        else
-          res[key] = val
-        end
-        res
       end
     end
 
@@ -553,6 +548,8 @@ module Sinatra
 
     # Dispatch a request with error handling.
     def dispatch!
+      filter!
+      static! if options.static? && (request.get? || request.head?)
       route!
     rescue NotFound => boom
       handle_not_found!(boom)
@@ -579,11 +576,16 @@ module Sinatra
 
     # Find an custom error block for the key(s) specified.
     def error_block!(*keys)
-      errmap = self.class.errors
       keys.each do |key|
-        if block = errmap[key]
-          res = instance_eval(&block)
-          return res
+        base = self.class
+        while base.respond_to?(:errors)
+          if block = base.errors[key]
+            # found a handler, eval and return result
+            res = instance_eval(&block)
+            return res
+          else
+            base = base.superclass
+          end
         end
       end
       nil
@@ -605,18 +607,37 @@ module Sinatra
       }.map! { |line| line.gsub(/^\.\//, '') }
     end
 
-    @routes     = {}
-    @filters    = []
-    @conditions = []
-    @templates  = {}
-    @middleware = []
-    @errors     = {}
-    @prototype  = nil
-    @extensions = []
-
     class << self
-      attr_accessor :routes, :filters, :conditions, :templates,
-        :middleware, :errors
+      attr_reader :routes, :filters, :templates, :errors
+
+      def reset!
+        @conditions = []
+        @routes     = {}
+        @filters    = []
+        @templates  = {}
+        @errors     = {}
+        @middleware = []
+        @prototype  = nil
+        @extensions = []
+      end
+
+      # Extension modules registered on this class and all superclasses.
+      def extensions
+        if superclass.respond_to?(:extensions)
+          (@extensions + superclass.extensions).uniq
+        else
+          @extensions
+        end
+      end
+
+      # Middleware used in this class and all superclasses.
+      def middleware
+        if superclass.respond_to?(:middleware)
+          superclass.middleware + @middleware
+        else
+          @middleware
+        end
+      end
 
       # Sets an option to the given value.  If the value is a proc,
       # the proc will be called every time the option is accessed.
@@ -784,7 +805,7 @@ module Sinatra
 
         invoke_hook(:route_added, verb, path, block)
 
-        (routes[verb] ||= []).
+        (@routes[verb] ||= []).
           push([pattern, keys, conditions, block]).last
       end
 
@@ -825,10 +846,6 @@ module Sinatra
       def helpers(*extensions, &block)
         class_eval(&block)  if block_given?
         include(*extensions) if extensions.any?
-      end
-
-      def extensions
-        (@extensions + (superclass.extensions rescue [])).uniq
       end
 
       def register(*extensions, &block)
@@ -901,33 +918,14 @@ module Sinatra
         builder.use Rack::CommonLogger    if logging?
         builder.use Rack::MethodOverride  if methodoverride?
         builder.use ShowExceptions        if show_exceptions?
+        middleware.each { |c,a,b| builder.use(c, *a, &b) }
 
-        @middleware.each { |c,a,b| builder.use(c, *a, &b) }
         builder.run super
         builder.to_app
       end
 
       def call(env)
         synchronize { prototype.call(env) }
-      end
-
-      def reset!(base=superclass)
-        @routes     = base.dupe_routes
-        @templates  = base.templates.dup
-        @conditions = []
-        @filters    = base.filters.dup
-        @errors     = base.errors.dup
-        @middleware = base.middleware.dup
-        @prototype  = nil
-        @extensions = []
-      end
-
-    protected
-      def dupe_routes
-        routes.inject({}) do |hash,(request_method,routes)|
-          hash[request_method] = routes.dup
-          hash
-        end
       end
 
     private
@@ -944,7 +942,7 @@ module Sinatra
       end
 
       def inherited(subclass)
-        subclass.reset! self
+        subclass.reset!
         super
       end
 
@@ -968,7 +966,7 @@ module Sinatra
         /\(.*\)/,              # generated code
         /custom_require\.rb$/, # rubygems require hacks
         /active_support/,      # active_support require hacks
-      ] unless self.const_defined?('CALLERS_TO_IGNORE')
+      ]
 
       # add rubinius (and hopefully other VM impls) ignore patterns ...
       CALLERS_TO_IGNORE.concat(RUBY_IGNORE_CALLERS) if defined?(RUBY_IGNORE_CALLERS)
@@ -987,10 +985,12 @@ module Sinatra
       end
     end
 
+    reset!
+
     set :raise_errors, true
     set :dump_errors, false
     set :clean_trace, true
-    set :show_exceptions, Proc.new { development? }
+    set :show_exceptions, false
     set :sessions, false
     set :logging, false
     set :methodoverride, false
@@ -1007,16 +1007,6 @@ module Sinatra
     set :views, Proc.new { root && File.join(root, 'views') }
     set :public, Proc.new { root && File.join(root, 'public') }
     set :lock, false
-
-    # static files route
-    get(/.*[^\/]$/) do
-      pass unless options.static? && options.public?
-      public_dir = File.expand_path(options.public)
-      path = File.expand_path(public_dir + unescape(request.path_info))
-      pass if path[0, public_dir.length] != public_dir
-      pass unless File.file?(path)
-      send_file path, :disposition => nil
-    end
 
     error ::Exception do
       response.status = 500
@@ -1058,9 +1048,11 @@ module Sinatra
     end
   end
 
-  # Base class for classic style (top-level) applications.
-  class Default < Base
+  # The top-level Application. All DSL methods executed on main are delegated
+  # to this class.
+  class Application < Base
     set :raise_errors, Proc.new { test? }
+    set :show_exceptions, Proc.new { development? }
     set :dump_errors, true
     set :sessions, false
     set :logging, Proc.new { ! test? }
@@ -1075,10 +1067,8 @@ module Sinatra
     end
   end
 
-  # The top-level Application. All DSL methods executed on main are delegated
-  # to this class.
-  class Application < Default
-  end
+  # Deprecated.
+  Default = Application
 
   # Sinatra delegation mixin. Mixing this module into an object causes all
   # methods to be delegated to the Sinatra::Application class. Used primarily
@@ -1111,11 +1101,11 @@ module Sinatra
 
   # Extend the top-level DSL with the modules provided.
   def self.register(*extensions, &block)
-    Default.register(*extensions, &block)
+    Application.register(*extensions, &block)
   end
 
   # Include the helper modules provided in Sinatra's request context.
   def self.helpers(*extensions, &block)
-    Default.helpers(*extensions, &block)
+    Application.helpers(*extensions, &block)
   end
 end
