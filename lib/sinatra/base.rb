@@ -353,7 +353,6 @@ module Sinatra
 
     def initialize(app=nil)
       @app = app
-      @running = false
       yield self if block_given?
     end
 
@@ -873,15 +872,6 @@ module Sinatra
         @middleware << [middleware, args, block]
       end
 
-      # Allow someone to externally query Sinatra to see if it
-      # is up and running yet (trap(:INT) has been set, etc).
-      #
-      # This is useful for Sinatra apps embedded inside of another
-      # program.
-      def running?
-        @running
-      end
-
       # Run the Sinatra app as a self-hosted server using
       # Thin, Mongrel or WEBrick (in that order)
       def run!(options={})
@@ -896,10 +886,8 @@ module Sinatra
             server.respond_to?(:stop!) ? server.stop! : server.stop
             puts "\n== Sinatra has ended his set (crowd applauds)" unless handler_name =~/cgi/i
           end
-          
-          @running = true
         end
-        
+        set :running, true
       rescue Errno::EADDRINUSE => e
         puts "== Someone is already performing on port #{port}!"
       end
@@ -997,7 +985,8 @@ module Sinatra
     set :static, false
     set :environment, (ENV['RACK_ENV'] || :development).to_sym
 
-    set :run, false
+    set :run, false                       # start server via at-exit hook?
+    set :running, false                   # is the built-in server running now?
     set :server, %w[thin mongrel webrick]
     set :host, '0.0.0.0'
     set :port, 4567
@@ -1086,8 +1075,8 @@ module Sinatra
     end
 
     delegate :get, :put, :post, :delete, :head, :template, :layout, :before,
-             :error, :not_found, :configures, :configure, :set, :set_option,
-             :set_options, :enable, :disable, :use, :development?, :test?,
+             :error, :not_found, :configure, :set,
+             :enable, :disable, :use, :development?, :test?,
              :production?, :use_in_file_templates!, :helpers
   end
 
